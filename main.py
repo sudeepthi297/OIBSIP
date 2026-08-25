@@ -1,414 +1,405 @@
-"""
-Desktop BMI Calculator & Health Tracker
-Built with Python 3, Tkinter (ttk), SQLite3, and Matplotlib.
+"""PyQt5 Weather Application with asynchronous API processing and unit conversions."""
 
-Author: Senior Python Developer
-Architecture: Modular (MVC-aligned design pattern)
-"""
+from datetime import datetime
+import os
+import sys
+from typing import Any, Dict, List, Optional
 
-import sqlite3
-import datetime
-from typing import List, Tuple, Dict, Any, Optional
-import tkinter as tk
-from tkinter import ttk, messagebox
+from PyQt5.QtCore import QThread, Qt, pyqtSignal
+from PyQt5.QtGui import QFont, QPixmap
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-import matplotlib
-matplotlib.use("TkAgg")
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from api_client import WeatherAPIClient, WeatherAPIError
 
 
-# ============================================================================
-# 1. CORE LOGIC & CALCULATION SERVICE
-# ============================================================================
+# -------------------------------------------------------------------
+# Multithreading / Worker Setup
+# -------------------------------------------------------------------
+class WeatherWorker(QThread):
+    """Worker thread to fetch weather data without blocking the GUI."""
 
-class BMICalculator:
-    """Handles BMI calculations, validations, and category evaluations."""
+    data_fetched = pyqtSignal(dict, dict, list)  # current_data, forecast_data, icon_bytes_list
+    error_occurred = pyqtSignal(str)
 
-    @staticmethod
-    def calculate_bmi(weight_kg: float, height_m: float) -> float:
-        """
-        Calculates Body Mass Index (BMI).
-        Formula: weight (kg) / (height (m)²)
-        """
-        if height_m <= 0:
-            raise ValueError("Height must be greater than 0.")
-        return round(weight_kg / (height_m ** 2), 2)
+    def __init__(self, api_client: WeatherAPIClient, query: Optional[str] = None, auto_detect: bool = False):
+        super().__init__()
+        self.api_client = api_client
+        self.query = query
+        self.auto_detect = auto_detect
 
-    @staticmethod
-    def get_category_and_color(bmi: float) -> Tuple[str, str]:
-        """Returns the Health Category name and hex color based on BMI score."""
-        if bmi < 18.5:
-            return "Underweight", "#3498db"  # Blue
-        elif 18.5 <= bmi <= 24.9:
-            return "Normal weight", "#2ecc71"  # Green
-        elif 25.0 <= bmi <= 29.9:
-            return "Overweight", "#f39c12"  # Orange
-        else:
-            return "Obese", "#e74c3c"  # Red
-
-    @staticmethod
-    def validate_inputs(height_cm: str, weight_kg: str) -> Tuple[float, float]:
-        """
-        Strictly validates numerical input limits:
-        - Height: 50 cm to 250 cm (converted to 0.5m - 2.5m)
-        - Weight: 10 kg to 300 kg
-        """
+    def run(self) -> None:
+        """Execute network tasks off the main thread."""
         try:
-            h_val = float(height_cm)
-            w_val = float(weight_kg)
-        except ValueError:
-            raise ValueError("Height and Weight must be valid numeric values.")
+            search_query = self.query
+            if self.auto_detect:
+                city, country = self.api_client.get_auto_location()
+                if not city:
+                    raise WeatherAPIError("Could not determine automatic location.")
+                search_query = f"{city},{country}" if country else city
 
-        # Height check
-        if not (50.0 <= h_val <= 250.0):
-            raise ValueError("Height must be between 50 cm and 250 cm (0.5m - 2.5m).")
+            if not search_query:
+                raise WeatherAPIError("Search query cannot be empty.")
 
-        # Weight check
-        if not (10.0 <= w_val <= 300.0):
-            raise ValueError("Weight must be between 10 kg and 300 kg.")
+            current_data = self.api_client.fetch_current_weather(search_query)
+            forecast_data = self.api_client.fetch_forecast(search_query)
 
-        height_m = h_val / 100.0  # Convert cm to meters
-        return height_m, w_val
+            # Pre-fetch main icon + hourly icons asynchronously
+            icons: List[bytes] = []
+            main_icon_code = current_data["weather"][0]["icon"]
+            icons.append(self.api_client.fetch_icon_bytes(main_icon_code))
 
+            # Fetch icons for next 6 hourly forecast slots
+            for item in forecast_data.get("list", [])[:6]:
+                icon_code = item["weather"][0]["icon"]
+                icons.append(self.api_client.fetch_icon_bytes(icon_code))
 
-# ============================================================================
-# 2. DATABASE PERSISTENCE LAYER
-# ============================================================================
+            self.data_fetched.emit(current_data, forecast_data, icons)
 
-class DatabaseManager:
-    """Manages SQLite3 connections, database schema, and CRUD transactions."""
-
-    def __init__(self, db_path: str = "bmi_tracker.db"):
-        self.db_path = db_path
-        self._init_db()
-
-    def _get_connection(self) -> sqlite3.Connection:
-        """Returns SQLite connection with foreign keys enabled."""
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA foreign_keys = ON;")
-        return conn
-
-    def _init_db(self) -> None:
-        """Initializes database schema if tables do not exist."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                # Users Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT UNIQUE NOT NULL
-                    )
-                """)
-                # BMI Records Table
-                cursor.execute("""
-                    CREATE TABLE IF NOT EXISTS bmi_records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER NOT NULL,
-                        weight REAL NOT NULL,
-                        height REAL NOT NULL,
-                        bmi REAL NOT NULL,
-                        category TEXT NOT NULL,
-                        timestamp TEXT NOT NULL,
-                        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-                    )
-                """)
-                conn.commit()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Database initialization failed: {e}")
-
-    def get_or_create_user(self, name: str) -> int:
-        """Fetches existing user ID or creates a new user profile."""
-        clean_name = name.strip()
-        if not clean_name:
-            raise ValueError("User name cannot be blank.")
-
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT id FROM users WHERE LOWER(name) = LOWER(?)", (clean_name,))
-                row = cursor.fetchone()
-                if row:
-                    return row[0]
-                
-                cursor.execute("INSERT INTO users (name) VALUES (?)", (clean_name,))
-                conn.commit()
-                return cursor.lastrowid
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Failed to fetch/create user: {e}")
-
-    def get_all_users(self) -> List[str]:
-        """Returns a list of all registered user names."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT name FROM users ORDER BY name ASC")
-                return [row[0] for row in cursor.fetchall()]
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Failed to fetch user list: {e}")
-
-    def add_record(self, user_id: int, weight: float, height: float, bmi: float, category: str) -> None:
-        """Persists a new BMI tracking record."""
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT INTO bmi_records (user_id, weight, height, bmi, category, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (user_id, weight, height, bmi, category, timestamp))
-                conn.commit()
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Failed to save record: {e}")
-
-    def get_user_records(self, user_id: int) -> List[Dict[str, Any]]:
-        """Retrieves historical tracking records for a specific user ID."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT weight, height, bmi, category, timestamp 
-                    FROM bmi_records 
-                    WHERE user_id = ? 
-                    ORDER BY timestamp ASC
-                """, (user_id,))
-                rows = cursor.fetchall()
-                
-                return [
-                    {
-                        "weight": r[0],
-                        "height": r[1],
-                        "bmi": r[2],
-                        "category": r[3],
-                        "timestamp": r[4]
-                    }
-                    for r in rows
-                ]
-        except sqlite3.Error as e:
-            raise RuntimeError(f"Failed to fetch historical data: {e}")
+        except WeatherAPIError as err:
+            self.error_occurred.emit(str(err))
+        except Exception as e:
+            self.error_occurred.emit(f"An unexpected error occurred: {str(e)}")
 
 
-# ============================================================================
-# 3. DATA VISUALIZATION COMPONENT
-# ============================================================================
-
-class TrendChart:
-    """Manages Matplotlib canvas rendering and threshold annotations."""
-
-    def __init__(self, parent_frame: ttk.Frame):
-        self.figure, self.ax = plt.subplots(figsize=(6, 4), dpi=100)
-        self.figure.patch.set_facecolor('#f5f6f7')
-        
-        self.canvas = FigureCanvasTkAgg(self.figure, master=parent_frame)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def plot_data(self, records: List[Dict[str, Any]], username: str) -> None:
-        """Re-draws line chart tracking user BMI over time with reference bands."""
-        self.ax.clear()
-        self.ax.set_facecolor('#ffffff')
-
-        if not records:
-            self.ax.text(0.5, 0.5, f"No historic records found for {username}", 
-                         ha='center', va='center', color='#7f8c8d', fontsize=10)
-            self.ax.set_axis_off()
-            self.canvas.draw()
-            return
-
-        self.ax.set_axis_on()
-        
-        # Format timestamps for X-axis display
-        dates = [r["timestamp"].split()[0] + "\n" + r["timestamp"].split()[1][:5] for r in records]
-        bmis = [r["bmi"] for r in records]
-
-        # Standard BMI Range Reference Lines & Fills
-        self.ax.axhspan(0, 18.5, color='#3498db', alpha=0.10, label='Underweight (<18.5)')
-        self.ax.axhspan(18.5, 24.9, color='#2ecc71', alpha=0.15, label='Normal (18.5–24.9)')
-        self.ax.axhspan(25.0, 29.9, color='#f39c12', alpha=0.10, label='Overweight (25–29.9)')
-        self.ax.axhspan(30.0, max(max(bmis) + 5, 40), color='#e74c3c', alpha=0.10, label='Obese (≥30)')
-
-        # User Trend Line
-        self.ax.plot(dates, bmis, marker='o', color='#2c3e50', linewidth=2, markersize=6, label='Your BMI')
-
-        # Formatting
-        self.ax.set_title(f"BMI History: {username}", fontsize=11, fontweight='bold', pad=10, color='#2c3e50')
-        self.ax.set_ylabel("BMI Score", fontsize=9, color='#2c3e50')
-        self.ax.grid(True, linestyle='--', alpha=0.5)
-        self.ax.tick_params(axis='x', labelsize=8, rotation=0)
-        self.ax.tick_params(axis='y', labelsize=8)
-
-        # Compact Legend
-        self.ax.legend(loc='upper left', fontsize=7, framealpha=0.8)
-
-        self.figure.tight_layout()
-        self.canvas.draw()
-
-
-# ============================================================================
-# 4. GUI APPLICATION LAYER
-# ============================================================================
-
-class BMIApp(tk.Tk):
-    """Main Application Interface (Tkinter UI Frame)."""
+# -------------------------------------------------------------------
+# Main UI Window
+# -------------------------------------------------------------------
+class WeatherAppUI(QWidget):
+    """Main PyQt5 Weather Dashboard Interface."""
 
     def __init__(self):
         super().__init__()
-        
-        self.title("Production-Grade BMI Health Tracker")
-        self.geometry("950x620")
-        self.minsize(850, 550)
+        # Retrieve API Key safely
+        api_key = os.getenv("OPENWEATHER_API_KEY", "")
+        if not api_key:
+            QMessageBox.critical(
+                self,
+                "API Key Missing",
+                "Environment variable OPENWEATHER_API_KEY is missing.\n"
+                "Please export your key and restart the application."
+            )
 
-        # Core Services
-        self.db = DatabaseManager()
-        
-        # Style Configuration
-        self._setup_styles()
-        
-        # Build UI Components
-        self._build_layout()
-        
-        # Initial Population
-        self.refresh_user_dropdown()
+        self.api_client = WeatherAPIClient(api_key=api_key or "DUMMY_KEY")
+        self.current_unit = "C"  # 'C' or 'F'
+        self.cached_current_data: Optional[Dict[str, Any]] = None
+        self.cached_forecast_data: Optional[Dict[str, Any]] = None
+        self.cached_icons: List[bytes] = []
 
-    def _setup_styles(self) -> None:
-        """Applies modern clean styling configuration using ttk."""
-        self.style = ttk.Style(self)
-        self.style.theme_use("clam")
+        self.init_ui()
 
-        # Global Colors
-        self.configure(bg="#f5f6f7")
-        self.style.configure(".", background="#f5f6f7", font=("Segoe UI", 10))
-        
-        # Label Frames
-        self.style.configure("TLabelframe", background="#ffffff", relief="flat")
-        self.style.configure("TLabelframe.Label", font=("Segoe UI", 10, "bold"), background="#ffffff", foreground="#2c3e50")
+    def init_ui(self) -> None:
+        """Initialize and assemble GUI elements."""
+        self.setWindowTitle("Professional Python Weather Dashboard")
+        self.setFixedSize(700, 750)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #1E1E2E;
+                color: #CDD6F4;
+                font-family: 'Segoe UI', Helvetica, Arial, sans-serif;
+            }
+            QLineEdit {
+                background-color: #313244;
+                border: 1px solid #45475A;
+                border-radius: 8px;
+                padding: 8px 12px;
+                font-size: 14px;
+                color: #CDD6F4;
+            }
+            QPushButton {
+                background-color: #89B4FA;
+                color: #11111B;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: bold;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: #B4BEFE;
+            }
+            QPushButton:disabled {
+                background-color: #45475A;
+                color: #A6ADC8;
+            }
+            QFrame {
+                background-color: #181825;
+                border-radius: 12px;
+            }
+        """)
 
-        # Custom Button
-        self.style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), background="#2980b9", foreground="#ffffff")
-        self.style.map("Primary.TButton", background=[("active", "#3498db")])
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
 
-    def _build_layout(self) -> None:
-        """Constructs two-pane responsive application interface layout."""
-        # Top Header Banner
-        header = tk.Frame(self, bg="#2c3e50", height=50)
-        header.pack(fill=tk.X, side=tk.TOP)
-        header_label = tk.Label(header, text="BMI Health Analytics Suite", bg="#2c3e50", fg="#ffffff", font=("Segoe UI", 14, "bold"))
-        header_label.pack(side=tk.LEFT, padx=20, pady=10)
+        # 1. Search Bar & Controls
+        search_layout = QHBoxLayout()
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter City or ZIP Code (e.g. London, 10001)...")
+        self.search_input.returnPressed.connect(self.handle_search)
 
-        # Central Split Container
-        main_container = ttk.Frame(self, padding=15)
-        main_container.pack(fill=tk.BOTH, expand=True)
+        self.btn_search = QPushButton("Search")
+        self.btn_search.clicked.connect(self.handle_search)
 
-        # Left Column: Input Forms & Display (Fixed Width Frame)
-        left_frame = ttk.LabelFrame(main_container, text=" User Input & Results ", padding=15)
-        left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        self.btn_auto_loc = QPushButton("📍 Auto")
+        self.btn_auto_loc.setToolTip("Detect Location via IP")
+        self.btn_auto_loc.clicked.connect(self.handle_auto_location)
 
-        # --- Form Controls ---
-        ttk.Label(left_frame, text="User Name / ID:").grid(row=0, column=0, sticky="w", pady=5)
-        self.user_combo = ttk.Combobox(left_frame, width=22)
-        self.user_combo.grid(row=0, column=1, sticky="w", pady=5)
-        self.user_combo.bind("<<ComboboxSelected>>", self._on_user_selected)
+        self.btn_unit_toggle = QPushButton("°C / °F")
+        self.btn_unit_toggle.setCheckable(True)
+        self.btn_unit_toggle.clicked.connect(self.toggle_units)
 
-        ttk.Label(left_frame, text="Height (cm):").grid(row=1, column=0, sticky="w", pady=5)
-        self.height_entry = ttk.Entry(left_frame, width=24)
-        self.height_entry.grid(row=1, column=1, sticky="w", pady=5)
+        search_layout.addWidget(self.search_input)
+        search_layout.addWidget(self.btn_search)
+        search_layout.addWidget(self.btn_auto_loc)
+        search_layout.addWidget(self.btn_unit_toggle)
 
-        ttk.Label(left_frame, text="Weight (kg):").grid(row=2, column=0, sticky="w", pady=5)
-        self.weight_entry = ttk.Entry(left_frame, width=24)
-        self.weight_entry.grid(row=2, column=1, sticky="w", pady=5)
+        # 2. Current Weather Panel
+        self.current_frame = QFrame()
+        current_layout = QVBoxLayout()
+        current_layout.setContentsMargins(20, 20, 20, 20)
 
-        # Process Action Button
-        calc_btn = ttk.Button(left_frame, text="Calculate & Save", style="Primary.TButton", command=self.on_calculate)
-        calc_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(15, 15))
-        # --- Dynamic Results Banner ---
-        ttk.Separator(left_frame, orient='horizontal').grid(row=4, column=0, columnspan=2, sticky="ew", pady=10)
+        self.lbl_city = QLabel("Search a city or use Auto-location")
+        self.lbl_city.setFont(QFont("Segoe UI", 18, QFont.Bold))
+        self.lbl_city.setAlignment(Qt.AlignCenter)
 
-        self.results_frame = tk.Frame(left_frame, bg="#ecf0f1", bd=1, relief="solid", padx=10,pady=10)
-        self.results_frame.grid(row=5, column=0, columnspan=2, sticky="ew", pady=10)
+        middle_current_layout = QHBoxLayout()
+        self.lbl_icon = QLabel()
+        self.lbl_icon.setFixedSize(100, 100)
+        self.lbl_icon.setScaledContents(True)
 
-        self.bmi_value_label = tk.Label(self.results_frame, text="BMI: --", font=("Segoe UI", 18, "bold"), bg="#ecf0f1", fg="#7f8c8d")
-        self.bmi_value_label.pack(pady=(5, 2))
+        self.lbl_temp = QLabel("-- °C")
+        self.lbl_temp.setFont(QFont("Segoe UI", 36, QFont.Bold))
 
-        self.category_badge = tk.Label(self.results_frame, text="Awaiting Input", font=("Segoe UI", 11, "bold"), 
-                                       bg="#7f8c8d", fg="#ffffff", padx=12, pady=4)
-        self.category_badge.pack(pady=(2, 5))
+        middle_current_layout.addStretch()
+        middle_current_layout.addWidget(self.lbl_icon)
+        middle_current_layout.addWidget(self.lbl_temp)
+        middle_current_layout.addStretch()
 
-        # Right Column: Visual Matplotlib Chart
-        right_frame = ttk.LabelFrame(main_container, text=" Historical BMI Trend Analysis ", padding=10)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        self.lbl_details = QLabel("Condition: -- | Humidity: --% | Wind: -- m/s")
+        self.lbl_details.setFont(QFont("Segoe UI", 11))
+        self.lbl_details.setAlignment(Qt.AlignCenter)
 
-        self.chart = TrendChart(right_frame)
+        current_layout.addWidget(self.lbl_city)
+        current_layout.addLayout(middle_current_layout)
+        current_layout.addWidget(self.lbl_details)
+        self.current_frame.setLayout(current_layout)
 
-    def refresh_user_dropdown(self) -> None:
-        """Loads known active user profiles into the dropdown selector."""
-        try:
-            users = self.db.get_all_users()
-            self.user_combo['values'] = users
-        except Exception as e:
-            messagebox.showerror("Database Error", str(e))
+        # 3. Hourly Forecast Panel (Next 6 periods)
+        self.hourly_frame = QFrame()
+        hourly_vlayout = QVBoxLayout()
+        hourly_title = QLabel("Hourly Forecast (Next 18 Hours)")
+        hourly_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        hourly_vlayout.addWidget(hourly_title)
 
-    def _on_user_selected(self, event: Optional[tk.Event] = None) -> None:
-        """Event handler when selecting a user from dropdown menu."""
-        user_name = self.user_combo.get().strip()
-        if user_name:
-            self.load_user_chart(user_name)
+        self.hourly_hlayout = QHBoxLayout()
+        self.hourly_widgets: List[Dict[str, QLabel]] = []
 
-    def load_user_chart(self, username: str) -> None:
-        """Fetches and displays historical tracking records on the Matplotlib canvas."""
-        try:
-            user_id = self.db.get_or_create_user(username)
-            records = self.db.get_user_records(user_id)
-            self.chart.plot_data(records, username)
-        except Exception as e:
-            messagebox.showerror("Error Loading Data", str(e))
+        for _ in range(6):
+            card = QFrame()
+            card.setStyleSheet("background-color: #313244;")
+            card_layout = QVBoxLayout()
+            card_layout.setContentsMargins(5, 5, 5, 5)
 
-    def on_calculate(self) -> None:
-        """Calculates BMI score, validates fields, persists data, and updates UI."""
-        username = self.user_combo.get().strip()
-        height_str = self.height_entry.get().strip()
-        weight_str = self.weight_entry.get().strip()
+            lbl_time = QLabel("--:--")
+            lbl_time.setAlignment(Qt.AlignCenter)
+            lbl_ico = QLabel()
+            lbl_ico.setFixedSize(40, 40)
+            lbl_ico.setScaledContents(True)
+            lbl_ico.setAlignment(Qt.AlignCenter)
+            lbl_tmp = QLabel("--°")
+            lbl_tmp.setAlignment(Qt.AlignCenter)
 
-        # Step 1: Input Validation
-        if not username:
-            messagebox.showwarning("Validation Error", "Please specify a User Name.")
+            card_layout.addWidget(lbl_time)
+            card_layout.addWidget(lbl_ico, alignment=Qt.AlignCenter)
+            card_layout.addWidget(lbl_tmp)
+            card.setLayout(card_layout)
+
+            self.hourly_hlayout.addWidget(card)
+            self.hourly_widgets.append({"time": lbl_time, "icon": lbl_ico, "temp": lbl_tmp})
+
+        hourly_vlayout.addLayout(self.hourly_hlayout)
+        self.hourly_frame.setLayout(hourly_vlayout)
+
+        # 4. Daily Forecast Panel (5 Days)
+        self.daily_frame = QFrame()
+        daily_vlayout = QVBoxLayout()
+        daily_title = QLabel("5-Day Daily Outlook")
+        daily_title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        daily_vlayout.addWidget(daily_title)
+
+        self.daily_widgets: List[Dict[str, QLabel]] = []
+        for _ in range(5):
+            row = QHBoxLayout()
+            lbl_day = QLabel("---")
+            lbl_desc = QLabel("---")
+            lbl_desc.setAlignment(Qt.AlignCenter)
+            lbl_temp_range = QLabel("--° / --°")
+            lbl_temp_range.setAlignment(Qt.AlignRight)
+
+            row.addWidget(lbl_day, stretch=2)
+            row.addWidget(lbl_desc, stretch=3)
+            row.addWidget(lbl_temp_range, stretch=2)
+
+            daily_vlayout.addLayout(row)
+            self.daily_widgets.append({"day": lbl_day, "desc": lbl_desc, "temp": lbl_temp_range})
+
+        self.daily_frame.setLayout(daily_vlayout)
+
+        # Build Main Layout
+        main_layout.addLayout(search_layout)
+        main_layout.addWidget(self.current_frame)
+        main_layout.addWidget(self.hourly_frame)
+        main_layout.addWidget(self.daily_frame)
+        self.setLayout(main_layout)
+
+    # -------------------------------------------------------------------
+    # Unit Helper Functions
+    # -------------------------------------------------------------------
+    def _convert_temp(self, celsius_val: float) -> float:
+        """Convert Celsius to Fahrenheit if unit is F, else return C."""
+        if self.current_unit == "F":
+            return (celsius_val * 9 / 5) + 32
+        return celsius_val
+
+    def toggle_units(self) -> None:
+        """Dynamically convert temperature labels without re-fetching API data."""
+        self.current_unit = "F" if self.btn_unit_toggle.isChecked() else "C"
+        if self.cached_current_data and self.cached_forecast_data:
+            self.render_weather(self.cached_current_data, self.cached_forecast_data, self.cached_icons)
+
+    # -------------------------------------------------------------------
+    # Event Handlers & Async Threading Trigger
+    # -------------------------------------------------------------------
+    def handle_search(self) -> None:
+        """Trigger search on user input."""
+        query = self.search_input.text().strip()
+        if not query:
+            self.show_error_popup("Input Error", "Please enter a valid City Name or ZIP Code.")
             return
+        self.start_async_fetch(query=query)
 
-        try:
-            height_m, weight_kg = BMICalculator.validate_inputs(height_str, weight_str)
-        except ValueError as err:
-            messagebox.showwarning("Validation Error", str(err))
-            return
+    def handle_auto_location(self) -> None:
+        """Trigger search using auto-location."""
+        self.start_async_fetch(auto_detect=True)
 
-        # Step 2: Compute Results
-        try:
-            bmi = BMICalculator.calculate_bmi(weight_kg, height_m)
-            category, color_hex = BMICalculator.get_category_and_color(bmi)
+    def start_async_fetch(self, query: Optional[str] = None, auto_detect: bool = False) -> None:
+        """Instantiate and run worker thread for non-blocking UI network operations."""
+        self.toggle_ui_controls(enabled=False)
 
-            # Step 3: Persist to DB
-            user_id = self.db.get_or_create_user(username)
-            self.db.add_record(user_id, weight_kg, height_m, bmi, category)
+        self.worker = WeatherWorker(self.api_client, query=query, auto_detect=auto_detect)
+        self.worker.data_fetched.connect(self.on_data_loaded)
+        self.worker.error_occurred.connect(self.on_data_error)
+        self.worker.finished.connect(lambda: self.toggle_ui_controls(enabled=True))
+        self.worker.start()
 
-            # Step 4: Refresh UI Elements
-            self.bmi_value_label.config(text=f"BMI: {bmi:.2f}", fg="#2c3e50")
-            self.category_badge.config(text=category.upper(), bg=color_hex, fg="#ffffff")
+    def toggle_ui_controls(self, enabled: bool) -> None:
+        """Enable or disable search controls during processing."""
+        self.btn_search.setEnabled(enabled)
+        self.btn_auto_loc.setEnabled(enabled)
+        self.search_input.setEnabled(enabled)
 
-            # Update Dropdown & Redraw Chart
-            self.refresh_user_dropdown()
-            self.user_combo.set(username)
-            self.load_user_chart(username)
+    # -------------------------------------------------------------------
+    # Rendering & Data Handlers
+    # -------------------------------------------------------------------
+    def on_data_loaded(self, current_data: dict, forecast_data: dict, icons: list) -> None:
+        """Cache data and trigger rendering."""
+        self.cached_current_data = current_data
+        self.cached_forecast_data = forecast_data
+        self.cached_icons = icons
+        self.render_weather(current_data, forecast_data, icons)
 
-            # Clear Numerical Entry Fields
-            self.height_entry.delete(0, tk.END)
-            self.weight_entry.delete(0, tk.END)
+    def on_data_error(self, message: str) -> None:
+        """Handle errors returned from worker thread."""
+        self.show_error_popup("Weather Data Error", message)
 
-        except Exception as err:
-            messagebox.showerror("Execution Error", f"An unexpected error occurred: {err}")
+    def show_error_popup(self, title: str, message: str) -> None:
+        """Modal Dialog error display inside the GUI."""
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle(title)
+        msg.setText(message)
+        msg.setStyleSheet("QLabel{ color: #CDD6F4; } QPushButton{ background-color: #89B4FA; color: #11111B; }")
+        msg.exec_()
+
+    def render_weather(self, current: dict, forecast: dict, icons: list) -> None:
+        """Update GUI widgets with calculated values and image pixmaps."""
+        unit_suffix = f"°{self.current_unit}"
+
+        # 1. Current Weather Render
+        city_name = current.get("name", "Unknown")
+        country = current.get("sys", {}).get("country", "")
+        temp_c = current["main"]["temp"]
+        humidity = current["main"]["humidity"]
+        wind = current["wind"]["speed"]
+        desc = current["weather"][0]["description"].title()
+
+        display_temp = self._convert_temp(temp_c)
+        self.lbl_city.setText(f"{city_name}, {country}")
+        self.lbl_temp.setText(f"{display_temp:.1f} {unit_suffix}")
+        self.lbl_details.setText(f"{desc} | Humidity: {humidity}% | Wind: {wind} m/s")
+
+        if icons and len(icons[0]) > 0:
+            pixmap = QPixmap()
+            pixmap.loadFromData(icons[0])
+            self.lbl_icon.setPixmap(pixmap)
+
+        # 2. Hourly Forecast Render (6 steps)
+        forecast_items = forecast.get("list", [])
+        for idx, widget_group in enumerate(self.hourly_widgets):
+            if idx < len(forecast_items):
+                item = forecast_items[idx]
+                dt = datetime.fromtimestamp(item["dt"])
+                h_temp = self._convert_temp(item["main"]["temp"])
+
+                widget_group["time"].setText(dt.strftime("%I %p"))
+                widget_group["temp"].setText(f"{h_temp:.0f}{unit_suffix}")
+
+                icon_idx = idx + 1
+                if icon_idx < len(icons) and len(icons[icon_idx]) > 0:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(icons[icon_idx])
+                    widget_group["icon"].setPixmap(pixmap)
+
+        # 3. Daily Forecast Render (Group 3-hour forecasts by day)
+        daily_groups: Dict[str, List[float]] = {}
+        daily_descriptions: Dict[str, str] = {}
+
+        for item in forecast_items:
+            day_str = datetime.fromtimestamp(item["dt"]).strftime("%A")
+            daily_groups.setdefault(day_str, []).append(item["main"]["temp"])
+            if day_str not in daily_descriptions:
+                daily_descriptions[day_str] = item["weather"][0]["description"].title()
+
+        for idx, (day, temps) in enumerate(daily_groups.items()):
+            if idx >= 5:
+                break
+            min_temp = self._convert_temp(min(temps))
+            max_temp = self._convert_temp(max(temps))
+
+            self.daily_widgets[idx]["day"].setText(day)
+            self.daily_widgets[idx]["desc"].setText(daily_descriptions[day])
+            self.daily_widgets[idx]["temp"].setText(f"{min_temp:.0f}° / {max_temp:.0f}{unit_suffix}")
 
 
-# ============================================================================
-# 5. ENTRY POINT
-# ============================================================================
+# -------------------------------------------------------------------
+# Application Entry Point
+# -------------------------------------------------------------------
+def main():
+    app = QApplication(sys.argv)
+    window = WeatherAppUI()
+    window.show()
+    sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
-    app = BMIApp()
-    app.mainloop()
+    main()
